@@ -3,7 +3,13 @@
    statechart definition, chart fragments, and routing helpers."
   #?(:cljs (:require-macros [com.fulcrologic.rad.statechart.form]))
   (:require
-    #?@(:clj [[cljs.analyzer :as ana]])
+    ;; Compile-time error reporting via macro-support's injectable `*macro-error*` (bound below in
+    ;; the macro to cljs.analyzer/error on :clj for located errors, ex-info on :bb). babashka can't
+    ;; load the cljs compiler, so it omits cljs.analyzer entirely. :cljs needs neither (macro code
+    ;; is :clj-only).
+    #?@(:bb  [[com.fulcrologic.fulcro.algorithms.macro-support :as ms]]
+        :clj [[cljs.analyzer :as ana]
+              [com.fulcrologic.fulcro.algorithms.macro-support :as ms]])
     [clojure.set :as set]
     [clojure.spec.alpha :as s]
     [com.fulcrologic.fulcro-i18n.i18n :refer [tr]]
@@ -39,7 +45,7 @@
     [com.fulcrologic.statecharts.integration.fulcro.routing :as scr]
     [com.fulcrologic.statecharts.integration.fulcro.routing-options :as sfro]
     [edn-query-language.core :as eql]
-    [taoensso.encore :as enc]
+    [com.fulcrologic.fulcro.algorithms.core :as core]
     [taoensso.timbre :as log]))
 
 (declare valid? invalid? cancel! undo-all! save! render-field rendering-env
@@ -481,23 +487,24 @@
 #?(:clj
    (defn defsc-form*
      [env args]
-     (let [{:keys [sym doc arglist options body]} (s/conform :com.fulcrologic.rad.form/defsc-form-args args)
-           options      (if (map? options)
-                          (opts/macro-optimize-options env options #{:com.fulcrologic.rad.form/subforms :com.fulcrologic.rad.form/validation-messages :com.fulcrologic.rad.form/field-styles} {})
-                          options)
-           hooks?       (and (comp/cljs? env) (:use-hooks? options))
-           nspc         (if (comp/cljs? env) (-> env :ns :name str) (name (ns-name *ns*)))
-           fqkw         (keyword (str nspc) (name sym))
-           body         (form-body arglist body)
-           [thissym propsym computedsym extra-args] arglist
-           location     (str nspc "." sym)
-           render-form  (if hooks?
-                          (#'comp/build-hooks-render sym thissym propsym computedsym extra-args body)
-                          (#'comp/build-render sym thissym propsym computedsym extra-args body))
-           options-expr `(assoc (convert-options ~fqkw ~location ~options) :render ~render-form
-                                                                           :componentName ~fqkw)]
+     (binding [ms/*macro-error* (fn [e msg] #?(:bb (ms/default-macro-error e msg) :clj (ana/error e msg)))]
+      (let [{:keys [sym doc arglist options body]} (s/conform :com.fulcrologic.rad.form/defsc-form-args args)
+            options      (if (map? options)
+                           (opts/macro-optimize-options env options #{:com.fulcrologic.rad.form/subforms :com.fulcrologic.rad.form/validation-messages :com.fulcrologic.rad.form/field-styles} {})
+                           options)
+            hooks?       (and (comp/cljs? env) (:use-hooks? options))
+            nspc         (if (comp/cljs? env) (-> env :ns :name str) (name (ns-name *ns*)))
+            fqkw         (keyword (str nspc) (name sym))
+            body         (form-body arglist body)
+            [thissym propsym computedsym extra-args] arglist
+            location     (str nspc "." sym)
+            render-form  (if hooks?
+                           (#'comp/build-hooks-render sym thissym propsym computedsym extra-args body)
+                           (#'comp/build-render sym thissym propsym computedsym extra-args body))
+            options-expr `(assoc (convert-options ~fqkw ~location ~options) :render ~render-form
+                                                                            :componentName ~fqkw)]
        (when (some #(= '_ %) arglist)
-         (throw (ana/error env "The arguments of defsc-form must be unique symbols other than _.")))
+         (throw (ms/macro-error env "The arguments of defsc-form must be unique symbols other than _.")))
        (cond
          hooks?
          `(do
@@ -523,7 +530,7 @@
             (declare ~sym)
             (let [options# ~options-expr]
               (def ~(vary-meta sym assoc :doc doc :once true)
-                (com.fulcrologic.fulcro.components/configure-component! ~(str sym) ~fqkw options#))))))))
+                (com.fulcrologic.fulcro.components/configure-component! ~(str sym) ~fqkw options#)))))))))
 
 #?(:clj
    (defmacro defsc-form
@@ -550,7 +557,8 @@
        (catch Exception e
          (if (contains? (ex-data e) :tag)
            (throw e)
-           (throw (ana/error &env "Unexpected internal error while processing defsc. Please check your syntax." e)))))))
+           (throw #?(:bb  (ms/macro-error &env "Unexpected internal error while processing defsc. Please check your syntax.")
+                     :clj (ana/error &env "Unexpected internal error while processing defsc. Please check your syntax." e))))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; LOGIC
@@ -1803,13 +1811,13 @@
                         :render        `(fn [this#]
                                           (comp/wrapped-render this#
                                             (fn []
-                                              (enc/when-let [props#   (comp/props this#)
+                                              (core/when-let [props#   (comp/props this#)]
                                                              [k#] (comp/get-ident this#)
                                                              factory# (some (fn [c#]
                                                                               (let [ck# (-> c# comp/component-options fo/id ao/qualified-key)]
                                                                                 (when (= ck# k#)
                                                                                   (comp/computed-factory c# {:keyfn ck#}))))
-                                                                        [~@RADForms])]
+                                                                        [~@RADForms])
                                                 (factory# props#)))))}]
        (if (comp/cljs? &env)
          `(do

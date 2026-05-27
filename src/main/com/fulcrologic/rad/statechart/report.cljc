@@ -12,9 +12,17 @@
   "
   #?(:cljs (:require-macros com.fulcrologic.rad.statechart.report))
   (:require
-    #?@(:clj
+    ;; Compile-time error reporting via macro-support's injectable `*macro-error*` (bound below in
+    ;; the macro to cljs.analyzer/error on :clj for located errors, ex-info on :bb). babashka can't
+    ;; load the cljs compiler, so it omits cljs.analyzer entirely. :cljs needs neither (macro code
+    ;; is :clj-only).
+    #?@(:bb
         [[clojure.pprint :refer [pprint]]
-         [cljs.analyzer :as ana]])
+         [com.fulcrologic.fulcro.algorithms.macro-support :as ms]]
+        :clj
+        [[clojure.pprint :refer [pprint]]
+         [cljs.analyzer :as ana]
+         [com.fulcrologic.fulcro.algorithms.macro-support :as ms]])
     [clojure.spec.alpha :as s]
     [com.fulcrologic.fulcro.components :as comp]
     [com.fulcrologic.fulcro.mutations :as m :refer [defmutation]]
@@ -41,7 +49,7 @@
     [com.fulcrologic.statecharts.integration.fulcro.routing-options :as sfro]
     [com.fulcrologic.rad.statechart.report-options :as sro]
     [edn-query-language.core :as eql]
-    [taoensso.encore :as enc]
+    [com.fulcrologic.fulcro.algorithms.core :as core]
     [taoensso.timbre :as log]))
 
 (defn report-ident
@@ -200,14 +208,14 @@
                                       (assoc-in $ path init-params)
                                       (reduce-kv
                                         (fn [s control-key {:keys [local? retain? default-value]}]
-                                          (let [event-value        (enc/nnil (get params control-key))
+                                          (let [event-value        (core/nnil (get params control-key))
                                                 control-value-path (if local?
                                                                      (conj report-ident :ui/parameters control-key)
                                                                      [:com.fulcrologic.rad.control/id control-key :com.fulcrologic.rad.control/value])
                                                 state-value        (when-not (false? retain?) (get-in state-map control-value-path))
                                                 explicit-value     event-value
                                                 default-value      (?! default-value app)
-                                                v                  (enc/nnil explicit-value state-value default-value)
+                                                v                  (core/nnil explicit-value state-value default-value)
                                                 skip?              (or (and (not local?) externally-controlled?)
                                                                      (nil? v))]
                                             (if skip? s (assoc-in s control-value-path v))))
@@ -656,10 +664,10 @@
    (defn req!
      ([env sym options k pred?]
       (when-not (and (contains? options k) (pred? (get options k)))
-        (throw (ana/error env (str "defsc-report " sym " is missing or invalid option " k)))))
+        (throw (ms/macro-error env (str "defsc-report " sym " is missing or invalid option " k)))))
      ([env sym options k]
       (when-not (contains? options k)
-        (throw (ana/error env (str "defsc-report " sym " is missing option " k)))))))
+        (throw (ms/macro-error env (str "defsc-report " sym " is missing option " k)))))))
 
 (defn start-report!
   "Start a report. Not normally needed, since a report is started when it is routed to; however, if you put
@@ -726,13 +734,14 @@
      for the report itself.
      "
      [sym arglist & args]
-     (let [this-sym  (first arglist)
-           props-sym (second arglist)
-           props-sym (if (map? props-sym) (:as props-sym) props-sym)
-           options   (first args)
-           options   (opts/macro-optimize-options &env options #{:com.fulcrologic.rad.report/column-formatters :com.fulcrologic.rad.report/field-formatters :com.fulcrologic.rad.report/column-headings :com.fulcrologic.rad.report/form-links} {})]
+     (binding [ms/*macro-error* (fn [e msg] #?(:bb (ms/default-macro-error e msg) :clj (ana/error e msg)))]
+      (let [this-sym  (first arglist)
+            props-sym (second arglist)
+            props-sym (if (map? props-sym) (:as props-sym) props-sym)
+            options   (first args)
+            options   (opts/macro-optimize-options &env options #{:com.fulcrologic.rad.report/column-formatters :com.fulcrologic.rad.report/field-formatters :com.fulcrologic.rad.report/column-headings :com.fulcrologic.rad.report/form-links} {})]
        (when (or (= '_ props-sym) (= '_ this-sym) (= props-sym this-sym) (not (symbol? this-sym)) (not (symbol? props-sym)))
-         (throw (ana/error &env (str "defsc-report argument list must use a real (unique) symbol (or a destructuring with `:as`) for the `this` and `props` (1st and 2nd) arguments."))))
+         (throw (ms/macro-error &env (str "defsc-report argument list must use a real (unique) symbol (or a destructuring with `:as`) for the `this` and `props` (1st and 2nd) arguments."))))
        (req! &env sym options :com.fulcrologic.rad.report/columns #(or (symbol? %) (every? symbol? %)))
        (req! &env sym options :com.fulcrologic.rad.report/row-pk #(symbol? %))
        (req! &env sym options :com.fulcrologic.rad.report/source-attribute keyword?)
@@ -742,11 +751,11 @@
           {:com.fulcrologic.rad.control/keys [controls]
            :com.fulcrologic.rad.report/keys [BodyItem edit-form columns row-pk form-links query-inclusions
                                              row-query-inclusion denormalize? row-actions route initialize-ui-props] :as options} options
-          _                 (when edit-form (throw (ana/error &env ":com.fulcrologic.rad.report/edit-form is no longer supported. Use :com.fulcrologic.rad.report/form-links instead.")))
+          _                 (when edit-form (throw (ms/macro-error &env ":com.fulcrologic.rad.report/edit-form is no longer supported. Use :com.fulcrologic.rad.report/form-links instead.")))
           normalize?        (not denormalize?)
           ItemClass         (or BodyItem generated-row-sym)
           subquery          `(comp/get-query ~ItemClass)
-          nspc              (if (enc/compiling-cljs?) (-> &env :ns :name str) (name (ns-name *ns*)))
+          nspc              (if (core/compiling-cljs?) (-> &env :ns :name str) (name (ns-name *ns*)))
           fqkw              (keyword (str nspc) (name sym))
           user-statechart   (sro/statechart options)
           query             (into [:com.fulcrologic.rad.report/id
@@ -810,9 +819,10 @@
                                `(comp/defsc ~sym ~arglist ~options ~@body)]
                               [`(comp/defsc ~sym ~arglist ~options ~@body)])]
          `(do
-            ~@defs)))))
+            ~@defs))))))
 
-#?(:clj (s/fdef defsc-report :args ::comp/args))
+;; NOTE: removed `(s/fdef defsc-report :args ::comp/args)` — `:com.fulcrologic.fulcro.components/args`
+;; is not a registered spec in current Fulcro, so the fdef failed to macroexpand on CLJ/babashka.
 
 (def form-link
   "Get the form link info for a given (column) key.
